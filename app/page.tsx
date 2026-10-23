@@ -2,14 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Download, Loader2, Play, Search, Trash2, XCircle } from "lucide-react";
-import { buildImportPreview, normalizeAddresses } from "@/lib/address";
+import { buildImportPreview, normalizeAddresses, parseAddressEntries } from "@/lib/address";
 import { db, clearLocalDatabase } from "@/lib/db";
 import { calculateTotals, downloadCsv, formatNumber, formatUsd, shortAddress } from "@/lib/format";
 import { createPendingResult, queryAddressesStreaming } from "@/lib/query";
 import type { AddressResult, ImportPreview, StoredAddress, StoredBatch } from "@/lib/types";
 
 type QueryScope = "input" | "batch" | "all";
-type SortKey = "totalValue" | "pusdBalance" | "positionsValue" | "tradeVolume";
+type SortKey = "totalValue" | "pusdBalance" | "positionsValue" | "tradeVolume" | "lastTradeNewest" | "lastTradeOldest";
+const MANUAL_NOTE_BATCH_NAME = "手动备注地址";
 
 export default function Home() {
   const [input, setInput] = useState("");
@@ -20,6 +21,7 @@ export default function Home() {
   const [results, setResults] = useState<AddressResult[]>([]);
   const [searchTerm, setSearchTerm] = useState("");
   const [sortKey, setSortKey] = useState<SortKey>("totalValue");
+  const [savingNoteAddress, setSavingNoteAddress] = useState<string | null>(null);
   const [querying, setQuerying] = useState(false);
   const [completed, setCompleted] = useState(0);
   const [totalToQuery, setTotalToQuery] = useState(0);
@@ -38,18 +40,25 @@ export default function Home() {
     ]);
     setAddresses(storedAddresses);
     setBatches(storedBatches);
-    setSelectedBatchId(storedBatches[0]?.id ?? "");
+    setSelectedBatchId((current) => current || storedBatches[0]?.id || "");
     setResults(latestResults);
   }
 
   const preview: ImportPreview = useMemo(() => buildImportPreview(input, addresses), [input, addresses]);
   const totals = useMemo(() => calculateTotals(results), [results]);
+  const hasIncompleteLpRewards = results.some(
+    (result) => result.status === "success" && (result.lpRewardsStatus === "partial" || result.lpRewardsStatus === "failed")
+  );
+  const hasIncompleteTradeStats = results.some(
+    (result) => result.status === "success" && (result.tradeStatsStatus === "partial" || result.tradeStatsStatus === "failed")
+  );
   const progress = totalToQuery > 0 ? Math.round((completed / totalToQuery) * 100) : 0;
+  const noteByAddress = useMemo(() => new Map(addresses.map((item) => [item.address.toLowerCase(), item.note ?? ""])), [addresses]);
 
   const visibleResults = useMemo(() => {
     return results
-      .filter((result) => result.address.toLowerCase().includes(searchTerm.trim().toLowerCase()))
-      .sort((a, b) => b[sortKey] - a[sortKey]);
+      .filter((result) => result.address.toLowerCase().includes(searchTerm.trim().toLowerCase()) || (result.note ?? "").toLowerCase().includes(searchTerm.trim().toLowerCase()))
+      .sort(compareResults(sortKey));
   }, [results, searchTerm, sortKey]);
 
   async function importBatch() {
@@ -65,7 +74,12 @@ export default function Home() {
     const now = Date.now();
     const batchId = crypto.randomUUID();
     const name = batchName.trim() || `批次 ${new Date(now).toLocaleString()}`;
-    const rows = preview.validAddresses.map((address) => ({ address, batchId, createdAt: now }));
+    const rows = preview.validEntries.map((entry) => ({
+      address: entry.address,
+      batchId,
+      createdAt: now,
+      note: entry.note
+    }));
     const batch: StoredBatch = { id: batchId, name, createdAt: now, importedCount: rows.length };
 
     await db.transaction("rw", db.addresses, db.batches, async () => {
@@ -88,6 +102,59 @@ export default function Home() {
     await loadLocalData();
   }
 
+  async function saveResultNote(address: string, note: string) {
+    try {
+      const hadAddress = addresses.some((item) => item.address.toLowerCase() === address.toLowerCase());
+      setSavingNoteAddress(address.toLowerCase());
+      await persistNote(address, note);
+      applyNoteToState(address, note);
+      if (!hadAddress) await loadLocalData();
+      setNotice("备注已保存。");
+    } catch (error) {
+      setNotice(error instanceof Error ? `备注保存失败：${error.message}` : "备注保存失败。");
+      throw error;
+    } finally {
+      setSavingNoteAddress(null);
+    }
+  }
+
+  async function persistNote(address: string, note: string) {
+    const now = Date.now();
+    await db.transaction("rw", db.addresses, db.batches, db.latestResults, async () => {
+      const existing = await db.addresses.get(address);
+      if (existing) {
+        await db.addresses.update(address, { note });
+      } else {
+        const batches = await db.batches.toArray();
+        let batch = batches.find((item) => item.name === MANUAL_NOTE_BATCH_NAME);
+        if (!batch) {
+          batch = {
+            id: crypto.randomUUID(),
+            name: MANUAL_NOTE_BATCH_NAME,
+            createdAt: now,
+            importedCount: 0
+          };
+          await db.batches.add(batch);
+        }
+        await db.addresses.put({ address, batchId: batch.id, createdAt: now, note });
+        await db.batches.update(batch.id, { importedCount: batch.importedCount + 1 });
+      }
+      await db.latestResults.update(address, { note });
+    });
+  }
+
+  function applyNoteToState(address: string, note: string) {
+    const key = address.toLowerCase();
+    setAddresses((items) => {
+      if (items.some((item) => item.address.toLowerCase() === key)) {
+        return items.map((item) => item.address.toLowerCase() === key ? { ...item, note } : item);
+      }
+      const batch = batches.find((item) => item.name === MANUAL_NOTE_BATCH_NAME);
+      return [...items, { address, batchId: batch?.id ?? MANUAL_NOTE_BATCH_NAME, createdAt: Date.now(), note }];
+    });
+    setResults((items) => items.map((item) => item.address.toLowerCase() === key ? { ...item, note } : item));
+  }
+
   async function clearAll() {
     if (!window.confirm("确认清空当前浏览器本地保存的地址、结果和查询历史吗？")) return;
     await clearLocalDatabase();
@@ -99,14 +166,31 @@ export default function Home() {
     setNotice("本地数据已清空。");
   }
 
+  function getQueryEntries(scope: QueryScope) {
+    if (scope === "input") {
+      const parsed = parseAddressEntries(input).entries;
+      return parsed.map((entry) => ({
+        address: entry.address,
+        note: noteByAddress.get(entry.address.toLowerCase()) || entry.note || ""
+      }));
+    }
+    if (scope === "batch") {
+      return addresses
+        .filter((item) => item.batchId === selectedBatchId)
+        .map((item) => ({ address: item.address, note: item.note ?? "" }));
+    }
+    return addresses.map((item) => ({ address: item.address, note: item.note ?? "" }));
+  }
+
   function getQueryAddresses(scope: QueryScope) {
     if (scope === "input") return normalizeAddresses(input).valid;
-    if (scope === "batch") return addresses.filter((item) => item.batchId === selectedBatchId).map((item) => item.address);
-    return addresses.map((item) => item.address);
+    return getQueryEntries(scope).map((item) => item.address);
   }
 
   async function runQuery(scope: QueryScope) {
-    const queryAddresses = Array.from(new Set(getQueryAddresses(scope)));
+    const queryEntries = dedupeEntries(getQueryEntries(scope));
+    const queryAddresses = queryEntries.map((entry) => entry.address);
+    const queryNotes = new Map(queryEntries.map((entry) => [entry.address.toLowerCase(), entry.note]));
     if (queryAddresses.length === 0) {
       setNotice("没有可查询的有效地址。");
       return;
@@ -117,18 +201,20 @@ export default function Home() {
     setQuerying(true);
     setCompleted(0);
     setTotalToQuery(queryAddresses.length);
-    setResults(queryAddresses.map(createPendingResult));
+    setResults(queryAddresses.map((address) => createPendingResult(address, queryNotes.get(address.toLowerCase()))));
     setNotice("查询中，结果会边返回边更新。");
 
-    const resultMap = new Map(queryAddresses.map((address) => [address.toLowerCase(), createPendingResult(address)]));
+    const resultMap = new Map(queryAddresses.map((address) => [address.toLowerCase(), createPendingResult(address, queryNotes.get(address.toLowerCase()))]));
 
     try {
       await queryAddressesStreaming(queryAddresses, controller.signal, (result, done) => {
-        resultMap.set(result.address.toLowerCase(), result);
+        const note = queryNotes.get(result.address.toLowerCase());
+        const resultWithNote = { ...result, note };
+        resultMap.set(result.address.toLowerCase(), resultWithNote);
         const nextResults = Array.from(resultMap.values());
         setResults(nextResults);
         setCompleted(done);
-        void db.latestResults.put(result);
+        void db.latestResults.put(resultWithNote);
       });
 
       const finalResults = Array.from(resultMap.values());
@@ -155,16 +241,17 @@ export default function Home() {
 
   function exportAddresses() {
     downloadCsv("polymarket-addresses.csv", [
-      ["address", "batchId", "createdAt"],
-      ...addresses.map((row) => [row.address, row.batchId, new Date(row.createdAt).toISOString()])
+      ["address", "batchId", "createdAt", "note"],
+      ...addresses.map((row) => [row.address, row.batchId, new Date(row.createdAt).toISOString(), row.note ?? ""])
     ]);
   }
 
   function exportResults() {
     downloadCsv("polymarket-results.csv", [
-      ["address", "pusdBalance", "positionsValue", "totalValue", "tradeVolume", "marketCount", "activeMonths", "activeDays", "status", "error"],
+      ["address", "note", "pusdBalance", "positionsValue", "totalValue", "tradeVolume", "marketCount", "activeMonths", "activeDays", "tradeStatsStatus", "tradeStatsError", "lpRewards", "lpRewardsStatus", "lpRewardsError", "lastTradeTime", "status", "error"],
       ...results.map((row) => [
         row.address,
+        row.note ?? "",
         row.pusdBalance,
         row.positionsValue,
         row.totalValue,
@@ -172,6 +259,12 @@ export default function Home() {
         row.marketCount,
         row.activeMonths,
         row.activeDays,
+        row.tradeStatsStatus ?? "",
+        row.tradeStatsError ?? "",
+        row.lpRewards ?? "",
+        row.lpRewardsStatus ?? "",
+        row.lpRewardsError ?? "",
+        row.lastTradeTime ?? lastTradeDisplay(row),
         row.status,
         row.error ?? ""
       ])
@@ -198,7 +291,7 @@ export default function Home() {
             <textarea
               value={input}
               onChange={(event) => setInput(event.target.value)}
-              placeholder="粘贴 Polymarket / EVM 地址，可用换行、空格、逗号分隔"
+              placeholder="粘贴 Polymarket / EVM 地址，可用换行、空格、逗号分隔；地址后可加备注"
               className="mt-3 h-44 w-full resize-y rounded-md border border-slate-300 bg-white p-3 text-sm outline-none ring-teal-500 focus:ring-2"
             />
             <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_auto]">
@@ -286,10 +379,12 @@ export default function Home() {
           </div>
         </section>
 
-        <section className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+        <section className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-7">
           <Overview label="总资产" value={formatUsd(totals.totalValue)} />
           <Overview label="总余额" value={formatUsd(totals.totalPusdBalance)} />
           <Overview label="总持仓市值" value={formatUsd(totals.totalPositionsValue)} />
+          <Overview label={hasIncompleteTradeStats ? "总交易额（含部分统计）" : "总交易额"} value={formatUsd(totals.totalTradeVolume)} />
+          <Overview label={hasIncompleteLpRewards ? "总 LP 奖励（含部分统计）" : "总 LP 奖励"} value={formatUsd(totals.totalLpRewards ?? 0)} />
           <Overview label="成功地址数" value={totals.successCount} />
           <Overview label="失败地址数" value={totals.failedCount} danger={totals.failedCount > 0} />
         </section>
@@ -298,12 +393,14 @@ export default function Home() {
           <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <h2 className="text-lg font-semibold text-slate-950">结果明细区</h2>
             <div className="flex flex-col gap-2 sm:flex-row">
-              <input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="搜索地址" className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none ring-teal-500 focus:ring-2" />
+              <input value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} placeholder="搜索地址或备注" className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none ring-teal-500 focus:ring-2" />
               <select value={sortKey} onChange={(event) => setSortKey(event.target.value as SortKey)} className="rounded-md border border-slate-300 px-3 py-2 text-sm outline-none ring-teal-500 focus:ring-2">
                 <option value="totalValue">按总资产排序</option>
                 <option value="pusdBalance">按余额排序</option>
                 <option value="positionsValue">按持仓市值排序</option>
                 <option value="tradeVolume">按历史交易额排序</option>
+                <option value="lastTradeNewest">按最近交易时间排序：最新优先</option>
+                <option value="lastTradeOldest">按最近交易时间排序：最旧优先</option>
               </select>
               <button onClick={exportResults} disabled={results.length === 0} className="inline-flex items-center justify-center gap-2 rounded-md border border-slate-300 px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">
                 <Download size={16} /> 导出结果 CSV
@@ -311,10 +408,11 @@ export default function Home() {
             </div>
           </div>
           <div className="mt-4 overflow-x-auto">
-            <table className="w-full min-w-[1120px] border-collapse text-sm">
+            <table className="w-full min-w-[1320px] border-collapse text-sm">
               <thead>
                 <tr className="border-b border-slate-200 text-left text-slate-500">
                   <th className="px-2 py-2">地址</th>
+                  <th className="px-2 py-2">备注</th>
                   <th className="px-2 py-2 text-right">pUSD 余额</th>
                   <th className="px-2 py-2 text-right">持仓市值</th>
                   <th className="px-2 py-2 text-right">总资产</th>
@@ -322,15 +420,24 @@ export default function Home() {
                   <th className="px-2 py-2 text-right">总交易市场数</th>
                   <th className="px-2 py-2 text-right">月活跃时间</th>
                   <th className="px-2 py-2 text-right">日活跃时间</th>
+                  <th className="px-2 py-2 text-right">历史 LP 奖励</th>
+                  <th className="px-2 py-2">最近交易时间</th>
                   <th className="px-2 py-2">查询状态</th>
                   <th className="px-2 py-2">错误信息</th>
                 </tr>
               </thead>
               <tbody>
                 {visibleResults.length === 0 ? (
-                  <tr><td colSpan={10} className="px-2 py-8 text-center text-slate-500">暂无查询结果</td></tr>
+                  <tr><td colSpan={13} className="px-2 py-8 text-center text-slate-500">暂无查询结果</td></tr>
                 ) : (
-                  visibleResults.map((result) => <ResultRow key={result.address} result={result} />)
+                  visibleResults.map((result) => (
+                    <ResultRow
+                      key={result.address}
+                      result={result}
+                      savingNote={savingNoteAddress === result.address.toLowerCase()}
+                      onSaveNote={saveResultNote}
+                    />
+                  ))
                 )}
               </tbody>
             </table>
@@ -339,6 +446,37 @@ export default function Home() {
       </div>
     </main>
   );
+}
+
+function dedupeEntries(entries: Array<{ address: string; note?: string }>) {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = entry.address.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function compareResults(sortKey: SortKey) {
+  return (a: AddressResult, b: AddressResult) => {
+    if (sortKey === "lastTradeNewest" || sortKey === "lastTradeOldest") {
+      const aTime = a.lastTradeStatus === "success" ? a.lastTradeTimestamp ?? 0 : 0;
+      const bTime = b.lastTradeStatus === "success" ? b.lastTradeTimestamp ?? 0 : 0;
+      if (!aTime && !bTime) return 0;
+      if (!aTime) return 1;
+      if (!bTime) return -1;
+      return sortKey === "lastTradeNewest" ? bTime - aTime : aTime - bTime;
+    }
+    return b[sortKey] - a[sortKey];
+  };
+}
+
+function lastTradeDisplay(result: AddressResult) {
+  if (result.lastTradeStatus === "success") return result.lastTradeTime ?? "";
+  if (result.lastTradeStatus === "empty") return "无交易记录";
+  if (result.lastTradeStatus === "failed") return "查询失败";
+  return "未查询";
 }
 
 function Metric({ label, value }: { label: string; value: number }) {
@@ -359,10 +497,27 @@ function Overview({ label, value, danger }: { label: string; value: string | num
   );
 }
 
-function ResultRow({ result }: { result: AddressResult }) {
+function ResultRow({
+  result,
+  onSaveNote,
+  savingNote
+}: {
+  result: AddressResult;
+  onSaveNote: (address: string, note: string) => Promise<void>;
+  savingNote: boolean;
+}) {
   const statusClass = result.status === "success" ? "bg-emerald-50 text-emerald-700" : result.status === "failed" ? "bg-red-50 text-red-700" : result.status === "canceled" ? "bg-amber-50 text-amber-700" : "bg-slate-100 text-slate-600";
   const pending = result.status === "pending";
   const pendingValue = "-";
+  const [editingNote, setEditingNote] = useState(false);
+  const [noteDraft, setNoteDraft] = useState(result.note ?? "");
+
+  async function saveDraft() {
+    const nextNote = noteDraft.trim();
+    setEditingNote(false);
+    if (nextNote === (result.note ?? "")) return;
+    await onSaveNote(result.address, nextNote);
+  }
 
   return (
     <tr className="border-b border-slate-100 align-top">
@@ -392,13 +547,63 @@ function ResultRow({ result }: { result: AddressResult }) {
           </div>
         </details>
       </td>
+      <td className="max-w-40 px-2 py-2">
+        {editingNote ? (
+          <input
+            autoFocus
+            disabled={savingNote}
+            value={noteDraft}
+            onChange={(event) => setNoteDraft(event.target.value)}
+            onBlur={() => void saveDraft()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") {
+                setNoteDraft(result.note ?? "");
+                setEditingNote(false);
+              }
+            }}
+            className="w-full rounded-md border border-slate-300 px-2 py-1 text-xs outline-none ring-teal-500 focus:ring-1"
+          />
+        ) : (
+          <button
+            type="button"
+            disabled={savingNote}
+            onClick={() => {
+              setNoteDraft(result.note ?? "");
+              setEditingNote(true);
+            }}
+            className="block max-w-full truncate text-left text-slate-700 hover:text-teal-700 disabled:opacity-60"
+            title={result.note ?? ""}
+          >
+            {savingNote ? "保存中..." : result.note || "添加备注"}
+          </button>
+        )}
+      </td>
       <td className="px-2 py-2 text-right">{pending ? pendingValue : formatUsd(result.pusdBalance)}</td>
       <td className="px-2 py-2 text-right">{pending ? pendingValue : formatUsd(result.positionsValue)}</td>
       <td className="px-2 py-2 text-right font-semibold">{pending ? pendingValue : formatUsd(result.totalValue)}</td>
-      <td className="px-2 py-2 text-right">{pending ? pendingValue : formatUsd(result.tradeVolume)}</td>
+      <td className="px-2 py-2 text-right">
+        {pending ? pendingValue : formatUsd(result.tradeVolume)}
+        {!pending && result.tradeStatsStatus === "partial" ? (
+          <div className="mt-1 text-xs text-amber-700" title={result.tradeStatsError ?? ""}>部分统计</div>
+        ) : null}
+        {!pending && result.tradeStatsStatus === "failed" ? (
+          <div className="mt-1 text-xs text-red-700" title={result.tradeStatsError ?? ""}>统计失败</div>
+        ) : null}
+      </td>
       <td className="px-2 py-2 text-right">{pending ? pendingValue : result.marketCount}</td>
       <td className="px-2 py-2 text-right">{pending ? pendingValue : result.activeMonths}</td>
       <td className="px-2 py-2 text-right">{pending ? pendingValue : result.activeDays}</td>
+      <td className="px-2 py-2 text-right">
+        {pending || result.lpRewards === undefined ? pendingValue : formatUsd(result.lpRewards)}
+        {!pending && result.lpRewardsStatus === "partial" ? (
+          <div className="mt-1 text-xs text-amber-700" title={result.lpRewardsError ?? ""}>部分统计</div>
+        ) : null}
+        {!pending && result.lpRewardsStatus === "failed" ? (
+          <div className="mt-1 text-xs text-red-700" title={result.lpRewardsError ?? ""}>统计失败</div>
+        ) : null}
+      </td>
+      <td className="px-2 py-2">{pending ? pendingValue : lastTradeDisplay(result)}</td>
       <td className="px-2 py-2"><span className={`rounded-md px-2 py-1 text-xs font-semibold ${statusClass}`}>{result.status}</span></td>
       <td className="max-w-56 px-2 py-2 text-red-700">{result.error ?? ""}</td>
     </tr>

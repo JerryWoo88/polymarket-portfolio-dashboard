@@ -26,6 +26,8 @@ export function emptyTotals(): QueryTotals {
     totalValue: 0,
     totalPusdBalance: 0,
     totalPositionsValue: 0,
+    totalTradeVolume: 0,
+    totalLpRewards: 0,
     successCount: 0,
     failedCount: 0
   };
@@ -37,6 +39,8 @@ export function calculateTotals(results: AddressResult[]): QueryTotals {
       totals.totalValue += result.totalValue;
       totals.totalPusdBalance += result.pusdBalance;
       totals.totalPositionsValue += result.positionsValue;
+      totals.totalTradeVolume += Number.isFinite(result.tradeVolume) ? result.tradeVolume : 0;
+      totals.totalLpRewards = (totals.totalLpRewards ?? 0) + (Number.isFinite(result.lpRewards) ? result.lpRewards ?? 0 : 0);
       totals.successCount += 1;
     } else if (result.status === "failed") {
       totals.failedCount += 1;
