@@ -9,7 +9,7 @@ import { createPendingResult, queryAddressesStreaming } from "@/lib/query";
 import type { AddressResult, ImportPreview, StoredAddress, StoredBatch } from "@/lib/types";
 
 type QueryScope = "input" | "batch" | "all";
-type SortKey = "totalValue" | "pusdBalance" | "positionsValue" | "tradeVolume" | "lastTradeNewest" | "lastTradeOldest";
+type SortKey = "totalValue" | "pusdBalance" | "positionsValue" | "tradeVolume" | "lpRewards" | "lastTradeNewest" | "lastTradeOldest";
 const MANUAL_NOTE_BATCH_NAME = "手动备注地址";
 
 export default function Home() {
@@ -399,6 +399,7 @@ export default function Home() {
                 <option value="pusdBalance">按余额排序</option>
                 <option value="positionsValue">按持仓市值排序</option>
                 <option value="tradeVolume">按历史交易额排序</option>
+                <option value="lpRewards">按历史 LP 奖励排序</option>
                 <option value="lastTradeNewest">按最近交易时间排序：最新优先</option>
                 <option value="lastTradeOldest">按最近交易时间排序：最旧优先</option>
               </select>
@@ -468,6 +469,7 @@ function compareResults(sortKey: SortKey) {
       if (!bTime) return -1;
       return sortKey === "lastTradeNewest" ? bTime - aTime : aTime - bTime;
     }
+    if (sortKey === "lpRewards") return (b.lpRewards ?? 0) - (a.lpRewards ?? 0);
     return b[sortKey] - a[sortKey];
   };
 }
